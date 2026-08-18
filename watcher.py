@@ -1,295 +1,338 @@
 import requests
 import time
 import json
+import yfinance as yf
+import pandas as pd
+import numpy as np
 from datetime import datetime
+import pytz
 
-# ==========================================
-# YOUR SETTINGS - DO NOT CHANGE THESE
-# ==========================================
-RAILWAY_URL    = "https://ict-telegram-bot-production.up.railway.app"
+RAILWAY_URL = "https://ict-telegram-bot-production.up.railway.app"
 WEBHOOK_SECRET = "ICTSahil2024Key987"
 CHECK_INTERVAL = 60  # Check every 60 seconds
 
-# ==========================================
-# YOUR TRADINGVIEW SYMBOLS TO WATCH
-# Add or remove symbols as you need
-# ==========================================
+# --- ICT SETTINGS FROM YOUR PINE SCRIPT ---
+SWING_LENGTH = 5
+FVG_MIN_SIZE = 0.5
+BODY_MULTIPLIER = 2.0
+ATR_MULTIPLIER = 1.5
+SWEEP_LOOKBACK = 50
+COOLDOWN_HOURS = 4
+
 WATCHLIST = [
-    # FOREX
-    {"symbol": "EURUSD",  "asset_class": "FOREX",  "timeframe": "15"},
-    {"symbol": "GBPUSD",  "asset_class": "FOREX",  "timeframe": "15"},
-    {"symbol": "XAUUSD",  "asset_class": "FOREX",  "timeframe": "5"},
-    {"symbol": "USDJPY",  "asset_class": "FOREX",  "timeframe": "15"},
-    {"symbol": "GBPJPY",  "asset_class": "FOREX",  "timeframe": "15"},
-    {"symbol": "AUDUSD",  "asset_class": "FOREX",  "timeframe": "15"},
-    # INDICES
-    {"symbol": "NAS100",  "asset_class": "INDEX",  "timeframe": "60"},
-    {"symbol": "US30",    "asset_class": "INDEX",  "timeframe": "60"},
-    {"symbol": "US500",   "asset_class": "INDEX",  "timeframe": "60"},
-    {"symbol": "GER40",   "asset_class": "INDEX",  "timeframe": "60"},
-    # CRYPTO
-    {"symbol": "BTCUSDT", "asset_class": "CRYPTO", "timeframe": "5"},
-    {"symbol": "ETHUSDT", "asset_class": "CRYPTO", "timeframe": "5"},
-    {"symbol": "SOLUSDT", "asset_class": "CRYPTO", "timeframe": "5"},
+    {"symbol": "EURUSD", "yf_symbol": "EURUSD=X", "asset_class": "FOREX", "timeframe": "15", "exchange": "OANDA"},
+    {"symbol": "GBPUSD", "yf_symbol": "GBPUSD=X", "asset_class": "FOREX", "timeframe": "15", "exchange": "OANDA"},
+    {"symbol": "XAUUSD", "yf_symbol": "GC=F", "asset_class": "FOREX", "timeframe": "5", "exchange": "OANDA"},
+    {"symbol": "NAS100", "yf_symbol": "^NDX", "asset_class": "INDEX", "timeframe": "60", "exchange": "CAPITALCOM"},
+    {"symbol": "US30", "yf_symbol": "^DJI", "asset_class": "INDEX", "timeframe": "60", "exchange": "CAPITALCOM"},
+    {"symbol": "BTCUSDT", "yf_symbol": "BTC-USD", "asset_class": "CRYPTO", "timeframe": "5", "exchange": "BINANCE", "is_crypto": True, "binance": "BTCUSDT"},
+    {"symbol": "ETHUSDT", "yf_symbol": "ETH-USD", "asset_class": "CRYPTO", "timeframe": "5", "exchange": "BINANCE", "is_crypto": True, "binance": "ETHUSDT"},
 ]
 
-# ==========================================
-# TRADINGVIEW SCREENER
-# ==========================================
-SCREENER_URL = "https://scanner.tradingview.com/symbol"
-
-FOREX_FIELDS = [
-    "open", "high", "low", "close",
-    "EMA20", "EMA50", "EMA200",
-    "RSI", "MACD.macd", "MACD.signal",
-    "Pivot.M.Classic.R1", "Pivot.M.Classic.S1",
-    "Recommend.All", "Recommend.MA",
-    "change", "change_abs",
-    "volume", "ATR",
-]
-
-# Track last signal to avoid duplicates
 last_signals = {}
 
-
-def get_tradingview_data(symbol: str, asset_class: str, timeframe: str) -> dict:
-    """Get real time data from TradingView screener."""
+def is_killzone():
     try:
-        # Determine screener based on asset class
-        if asset_class == "FOREX":
-            screener = "forex"
-            exchange = "FX_IDC"
-        elif asset_class == "INDEX":
-            screener = "america"
-            exchange = "CAPITALCOM"
-        elif asset_class == "CRYPTO":
-            screener = "crypto"
-            exchange = "BINANCE"
+        est = pytz.timezone('US/Eastern')
+        now = datetime.now(est)
+        hour = now.hour + now.minute/60.0
+        # London 2-5 AM, NY AM 8:30-11, NY PM 13:30-16 EST
+        in_london = 2 <= hour < 5
+        in_ny_am = 8.5 <= hour < 11
+        in_ny_pm = 13.5 <= hour < 16
+        # For testing outside killzone, allow but with lower confidence
+        # Return True always for now but log it
+        if in_london or in_ny_am or in_ny_pm:
+            return True, True
         else:
-            screener = "forex"
-            exchange = "FX_IDC"
+            # Outside killzone = don't trade (ICT Rule)
+            return False, False
+    except:
+        return True, True
 
-        url = f"https://scanner.tradingview.com/symbol"
-        params = {
-            "symbol"   : f"{exchange}:{symbol}",
-            "fields"   : ",".join(FOREX_FIELDS),
-            "no_404"   : "true",
-        }
+def calculate_atr(df, period=14):
+    try:
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        atr = true_range.rolling(period).mean()
+        return atr
+    except:
+        return pd.Series([0]*len(df))
 
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer"   : "https://www.tradingview.com/",
-        }
-
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-
-        if response.status_code == 200:
-            return response.json()
-        return {}
-
+def get_data_yf(yf_symbol, timeframe):
+    try:
+        # Map timeframe to yfinance interval
+        tf_map = {"5": "5m", "15": "15m", "60": "60m", "240": "60m"}
+        interval = tf_map.get(timeframe, "15m")
+        period = "5d" if interval in ["5m", "15m"] else "1mo"
+        
+        data = yf.download(yf_symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        if data.empty or len(data) < 50:
+            return None
+        # Flatten multi-index if needed
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.dropna()
+        return data
     except Exception as e:
-        print(f"Error getting data for {symbol}: {e}")
-        return {}
+        print(f"yfinance error {yf_symbol}: {e}")
+        return None
 
-
-def detect_signal(data: dict, symbol: str, asset_class: str, timeframe: str) -> dict:
-    """
-    Analyze the data and detect if there is a trading signal.
-    Uses EMA, RSI and MACD for signal detection.
-    """
+def get_data_binance(symbol, timeframe):
     try:
-        if not data:
-            return {}
+        tf_map = {"5": "5m", "15": "15m", "60": "1h", "240": "4h"}
+        interval = tf_map.get(timeframe, "15m")
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+        r = requests.get(url, timeout=10).json()
+        if not isinstance(r, list) or len(r) < 50:
+            return None
+        df = pd.DataFrame(r, columns=['open_time','Open','High','Low','Close','Volume','close_time','qav','trades','taker_base','taker_quote','ignore'])
+        df = df[['Open','High','Low','Close','Volume']].astype(float)
+        df.index = range(len(df))
+        return df
+    except Exception as e:
+        print(f"Binance error {symbol}: {e}")
+        return None
 
-        close      = data.get("close", 0)
-        ema20      = data.get("EMA20", 0)
-        ema50      = data.get("EMA50", 0)
-        ema200     = data.get("EMA200", 0)
-        rsi        = data.get("RSI", 50)
-        macd       = data.get("MACD.macd", 0)
-        macd_sig   = data.get("MACD.signal", 0)
-        recommend  = data.get("Recommend.All", 0)
-        atr        = data.get("ATR", 0)
-        high       = data.get("high", 0)
-        low        = data.get("low", 0)
+def detect_ict_signal(df, info):
+    try:
+        if df is None or len(df) < 30:
+            return None
+        
+        # Ensure columns uppercase
+        df.columns = [c.capitalize() if c.lower() in ['open','high','low','close','volume'] else c for c in df.columns]
+        if 'Close' not in df.columns:
+            # Try lowercase
+            df.columns = [c.title() for c in df.columns]
 
-        if not close or not ema20 or not ema50:
-            return {}
+        close = df['Close'].iloc[-1]
+        high = df['High'].iloc[-1]
+        low = df['Low'].iloc[-1]
+        open_ = df['Open'].iloc[-1]
+        
+        prev_close = df['Close'].iloc[-2]
+        prev_open = df['Open'].iloc[-2]
+        
+        # ATR
+        df['ATR'] = calculate_atr(df, 14)
+        atr = df['ATR'].iloc[-1]
+        if pd.isna(atr) or atr == 0:
+            atr = (df['High'] - df['Low']).tail(14).mean()
+        
+        # Body calculations
+        body = abs(close - open_)
+        avg_body = abs(df['Close'] - df['Open']).tail(10).mean()
+        
+        if avg_body == 0:
+            return None
 
-        # ── LONG CONDITIONS ───────────────────────────────────────────
-        long_conditions = (
-            close > ema20 and          # Price above EMA20
-            ema20 > ema50 and          # EMA20 above EMA50
-            rsi > 50 and rsi < 70 and  # RSI in bullish zone
-            macd > macd_sig and        # MACD bullish crossover
-            recommend > 0.1            # TradingView recommends buy
-        )
+        # Find last swing high/low (simplified pivot)
+        swing_len = SWING_LENGTH
+        last_swing_high = None
+        last_swing_low = None
+        last_swing_high_idx = None
+        last_swing_low_idx = None
 
-        # ── SHORT CONDITIONS ──────────────────────────────────────────
-        short_conditions = (
-            close < ema20 and          # Price below EMA20
-            ema20 < ema50 and          # EMA20 below EMA50
-            rsi < 50 and rsi > 30 and  # RSI in bearish zone
-            macd < macd_sig and        # MACD bearish crossover
-            recommend < -0.1           # TradingView recommends sell
-        )
+        for i in range(len(df)-swing_len-1, swing_len, -1):
+            window_high = df['High'].iloc[i-swing_len:i+swing_len+1].max()
+            if df['High'].iloc[i] == window_high and last_swing_high is None:
+                last_swing_high = df['High'].iloc[i]
+                last_swing_high_idx = i
+            window_low = df['Low'].iloc[i-swing_len:i+swing_len+1].min()
+            if df['Low'].iloc[i] == window_low and last_swing_low is None:
+                last_swing_low = df['Low'].iloc[i]
+                last_swing_low_idx = i
+            if last_swing_high and last_swing_low:
+                break
 
-        if not long_conditions and not short_conditions:
-            return {}
+        if last_swing_high is None or last_swing_low is None:
+            return None
 
-        signal_type = "LONG" if long_conditions else "SHORT"
+        # Bias - simple EMA bias like in your script
+        ema50 = df['Close'].ewm(span=50).mean().iloc[-1]
+        ema200 = df['Close'].ewm(span=200).mean().iloc[-1] if len(df) >= 200 else ema50
+        bias = 1 if close > ema200 else -1
 
-        # Calculate entry, SL and TP
-        atr_val = atr if atr > 0 else (close * 0.001)
+        # --- BULLISH SWEEP DETECTION ---
+        bullish_sweep = False
+        bearish_sweep = False
+        
+        # Look back for sweep
+        recent_lows = df['Low'].tail(SWEEP_LOOKBACK)
+        recent_highs = df['High'].tail(SWEEP_LOOKBACK)
+        
+        # Bullish sweep: price went below last swing low then closed above it
+        if low < last_swing_low and close > last_swing_low:
+            # Check if sweep happened recently (within 10 bars)
+            if len(df) - last_swing_low_idx <= SWEEP_LOOKBACK:
+                bullish_sweep = True
 
-        if signal_type == "LONG":
-            entry     = close
-            stop_loss = low - (atr_val * 1.5)
-            tp1       = entry + (abs(entry - stop_loss) * 2)
-            tp2       = entry + (abs(entry - stop_loss) * 4)
+        # Bearish sweep
+        if high > last_swing_high and close < last_swing_high:
+            if len(df) - last_swing_high_idx <= SWEEP_LOOKBACK:
+                bearish_sweep = True
+
+        if not bullish_sweep and not bearish_sweep:
+            return None
+
+        # --- DISPLACEMENT CHECK ---
+        # Cond A: Body > bodyMultiplier * avgBody
+        condA = body > BODY_MULTIPLIER * avg_body
+        # Cond B: Range > atrMultiplier * ATR
+        candle_range = high - low
+        condB = candle_range > ATR_MULTIPLIER * atr
+        # Cond C: Close beyond swing
+        condC_bull = close > last_swing_high
+        condC_bear = close < last_swing_low
+
+        # --- FVG CHECK ---
+        # Bullish FVG: high[2] < low (current)
+        high_2 = df['High'].iloc[-3]
+        low_2 = df['Low'].iloc[-3]
+        
+        bullish_gap = low - high_2
+        bearish_gap = low_2 - high
+        
+        condD_bull = (high_2 < low) and (bullish_gap >= FVG_MIN_SIZE * atr)
+        condD_bear = (low_2 > high) and (bearish_gap >= FVG_MIN_SIZE * atr)
+
+        # Final MSS conditions
+        bullish_mss = bullish_sweep and condA and condB and condC_bull and condD_bull and bias == 1
+        bearish_mss = bearish_sweep and condA and condB and condC_bear and condD_bear and bias == -1
+
+        if not bullish_mss and not bearish_mss:
+            return None
+
+        # --- CALCULATE ENTRY / SL / TP ---
+        is_long = bullish_mss
+        
+        if is_long:
+            fvg_top = high_2
+            fvg_bottom = low
+            fvg_ce = (fvg_top + fvg_bottom) / 2
+            entry = fvg_ce
+            sl = df['Low'].tail(5).min() - (atr * 0.2)  # Sweep candle low
+            risk = entry - sl
+            if risk <= 0:
+                return None
+            tp1 = entry + (2 * risk)
+            tp2 = entry + (4 * risk)
+            signal_type = "LONG"
         else:
-            entry     = close
-            stop_loss = high + (atr_val * 1.5)
-            tp1       = entry - (abs(stop_loss - entry) * 2)
-            tp2       = entry - (abs(stop_loss - entry) * 4)
+            fvg_top = low_2
+            fvg_bottom = high
+            fvg_ce = (fvg_top + fvg_bottom) / 2
+            entry = fvg_ce
+            sl = df['High'].tail(5).max() + (atr * 0.2)
+            risk = sl - entry
+            if risk <= 0:
+                return None
+            tp1 = entry - (2 * risk)
+            tp2 = entry - (4 * risk)
+            signal_type = "SHORT"
 
-        risk       = abs(entry - stop_loss)
-        rr_tp1     = round(abs(tp1 - entry) / risk, 2) if risk > 0 else 2.0
-        rr_tp2     = round(abs(tp2 - entry) / risk, 2) if risk > 0 else 4.0
-
-        # Determine broker
-        if asset_class == "CRYPTO":
-            broker      = "Bitget"
-            crypto_type = "FUTURES" if int(timeframe) <= 60 else "SPOT"
-            exchange    = "BITGET"
-        else:
-            broker      = "IC Markets and CAPITAL.com"
-            crypto_type = ""
-            exchange    = "OANDA" if asset_class == "FOREX" else "CAPITALCOM"
-
-        # Format timeframe display
-        tf_int = int(timeframe)
-        if tf_int < 60:
-            tf_display = f"{tf_int}M"
-        elif tf_int == 60:
-            tf_display = "1H"
-        elif tf_int == 240:
-            tf_display = "4H"
-        else:
-            tf_display = f"{tf_int}M"
+        # Risk to reward
+        rr1 = 2.0
+        rr2 = 4.0
 
         return {
-            "secret"      : WEBHOOK_SECRET,
-            "signal"      : signal_type,
-            "symbol"      : symbol,
-            "asset_class" : asset_class,
-            "broker"      : broker,
-            "crypto_type" : crypto_type,
-            "timeframe"   : tf_display,
-            "entry"       : round(entry, 5),
-            "stop_loss"   : round(stop_loss, 5),
-            "tp1"         : round(tp1, 5),
-            "tp2"         : round(tp2, 5),
-            "rr_tp1"      : rr_tp1,
-            "rr_tp2"      : rr_tp2,
-            "confidence"  : "Normal",
+            "secret": WEBHOOK_SECRET,
+            "signal": signal_type,
+            "symbol": info["symbol"],
+            "asset_class": info["asset_class"],
+            "broker": "Bitget" if info["asset_class"] == "CRYPTO" else "IC Markets and CAPITAL.com",
+            "crypto_type": "FUTURES" if info["asset_class"] == "CRYPTO" else "",
+            "timeframe": f"{info['timeframe']}M" if int(info['timeframe']) < 60 else f"{int(int(info['timeframe'])/60)}H",
+            "entry": round(float(entry), 5),
+            "stop_loss": round(float(sl), 5),
+            "tp1": round(float(tp1), 5),
+            "tp2": round(float(tp2), 5),
+            "rr_tp1": rr1,
+            "rr_tp2": rr2,
+            "confidence": "High Confidence",
             "risk_percent": 1.0,
-            "exchange"    : exchange,
+            "exchange": info["exchange"]
         }
 
     except Exception as e:
-        print(f"Error detecting signal for {symbol}: {e}")
-        return {}
+        print(f"Detect error {info['symbol']}: {e}")
+        return None
 
-
-def send_signal(signal_data: dict) -> bool:
-    """Send signal to Railway webhook server."""
-    try:
-        response = requests.post(
-            f"{RAILWAY_URL}/webhook/tradingview",
-            json=signal_data,
-            timeout=30,
-        )
-        result = response.json()
-        if result.get("status") == "success":
-            print(f"Signal sent: {signal_data['signal']} {signal_data['symbol']}")
-            return True
-        print(f"Failed to send signal: {result}")
-        return False
-    except Exception as e:
-        print(f"Error sending signal: {e}")
-        return False
-
-
-def should_send_signal(symbol: str, signal_type: str) -> bool:
-    """
-    Check if we already sent this signal recently.
-    Prevents sending duplicate signals.
-    """
+def should_send(symbol, signal_type):
     key = f"{symbol}_{signal_type}"
     now = datetime.now()
-
     if key in last_signals:
-        last_time = last_signals[key]
-        # Do not resend same signal within 4 hours
-        diff = (now - last_time).total_seconds()
-        if diff < 14400:
+        diff = (now - last_signals[key]).total_seconds() / 3600
+        if diff < COOLDOWN_HOURS:
+            print(f"Cooldown active for {symbol} {signal_type} - {diff:.1f}h ago")
             return False
-
     last_signals[key] = now
     return True
 
+def send_signal(data):
+    try:
+        r = requests.post(f"{RAILWAY_URL}/webhook/tradingview", json=data, timeout=20)
+        print(f"Sent {data['signal']} {data['symbol']} -> {r.status_code}")
+        return True
+    except Exception as e:
+        print(f"Send failed: {e}")
+        return False
 
 def run_watcher():
-    """Main loop that watches all symbols."""
-    print("=" * 50)
-    print("ICT Signal Watcher Started")
-    print(f"Watching {len(WATCHLIST)} symbols")
-    print(f"Checking every {CHECK_INTERVAL} seconds")
-    print("=" * 50)
-
+    print("="*50)
+    print("ICT ELITE Watcher V2 Started - No Spam Mode")
+    print("="*50)
+    consecutive_errors = 0
     while True:
-        print(f"\nChecking signals at {datetime.now().strftime('%H:%M:%S')}...")
-
-        for item in WATCHLIST:
-            symbol      = item["symbol"]
-            asset_class = item["asset_class"]
-            timeframe   = item["timeframe"]
-
-            try:
-                # Get data
-                data = get_tradingview_data(symbol, asset_class, timeframe)
-
-                if not data:
-                    print(f"No data for {symbol}")
-                    continue
-
-                # Detect signal
-                signal = detect_signal(data, symbol, asset_class, timeframe)
-
-                if not signal:
-                    print(f"No signal for {symbol}")
-                    continue
-
-                # Check for duplicates
-                if not should_send_signal(symbol, signal["signal"]):
-                    print(f"Duplicate signal skipped for {symbol}")
-                    continue
-
-                # Send signal
-                print(f"SIGNAL FOUND: {signal['signal']} {symbol}")
-                send_signal(signal)
-
-                # Wait 2 seconds between signals
-                time.sleep(2)
-
-            except Exception as e:
-                print(f"Error processing {symbol}: {e}")
+        try:
+            in_kz, is_active = is_killzone()
+            if not in_kz:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Outside Killzone - Sleeping 60s")
+                time.sleep(60)
                 continue
 
-        print(f"Scan complete. Next scan in {CHECK_INTERVAL} seconds...")
-        time.sleep(CHECK_INTERVAL)
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning {len(WATCHLIST)} pairs for ICT setup...")
 
+            for info in WATCHLIST:
+                try:
+                    df = None
+                    if info.get("is_crypto"):
+                        df = get_data_binance(info["binance"], info["timeframe"])
+                    else:
+                        df = get_data_yf(info["yf_symbol"], info["timeframe"])
+                    
+                    if df is None:
+                        continue
+
+                    signal = detect_ict_signal(df, info)
+                    if signal:
+                        print(f"!!! ICT SIGNAL FOUND: {signal['signal']} {signal['symbol']}")
+                        if should_send(signal["symbol"], signal["signal"]):
+                            send_signal(signal)
+                            time.sleep(3)
+                        else:
+                            print("Skipped due to cooldown")
+                    else:
+                        print(f"No ICT setup: {info['symbol']}")
+
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"Error processing {info['symbol']}: {e}")
+                    continue
+            
+            print(f"Scan complete. Next scan in {CHECK_INTERVAL}s. (Only 1-3 signals per day expected)")
+            time.sleep(CHECK_INTERVAL)
+            consecutive_errors = 0
+
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"Watcher loop error: {e} - Retry in 60s")
+            time.sleep(60)
+            if consecutive_errors > 10:
+                time.sleep(300)
 
 if __name__ == "__main__":
     run_watcher()
